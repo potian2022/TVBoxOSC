@@ -42,7 +42,8 @@
             android:gravity="center"
             android:text="确定键删除当前选中记录"
             android:textColor="@android:color/white"
-            android:textSize="@dimen/ts_24" />
+            android:textSize="@dimen/ts_24"
+            android:visibility="gone" />
 
         <TextView
             android:id="@+id/tvDel"
