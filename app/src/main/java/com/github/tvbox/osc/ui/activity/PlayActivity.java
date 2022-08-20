@@ -14,6 +14,8 @@ import android.view.KeyEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.webkit.ConsoleMessage;
+import android.webkit.JsPromptResult;
+import android.webkit.JsResult;
 import android.webkit.SslErrorHandler;
 import android.webkit.ValueCallback;
 import android.webkit.WebChromeClient;
@@ -42,6 +44,8 @@ import com.github.tvbox.osc.bean.VodInfo;
 import com.github.tvbox.osc.cache.CacheManager;
 import com.github.tvbox.osc.event.RefreshEvent;
 import com.github.tvbox.osc.player.controller.VodController;
+import com.github.tvbox.osc.player.thirdparty.MXPlayer;
+import com.github.tvbox.osc.player.thirdparty.ReexPlayer;
 import com.github.tvbox.osc.util.AdBlocker;
 import com.github.tvbox.osc.util.DefaultConfig;
 import com.github.tvbox.osc.util.HawkConfig;
@@ -49,6 +53,7 @@ import com.github.tvbox.osc.util.LOG;
 import com.github.tvbox.osc.util.MD5;
 import com.github.tvbox.osc.util.PlayerHelper;
 import com.github.tvbox.osc.util.XWalkUtils;
+import com.github.tvbox.osc.util.thunder.Thunder;
 import com.github.tvbox.osc.viewmodel.SourceViewModel;
 import com.lzy.okgo.OkGo;
 import com.lzy.okgo.callback.AbsCallback;
@@ -59,6 +64,7 @@ import com.orhanobut.hawk.Hawk;
 import org.greenrobot.eventbus.EventBus;
 import org.json.JSONException;
 import org.json.JSONObject;
+import org.xwalk.core.XWalkJavascriptResult;
 import org.xwalk.core.XWalkResourceClient;
 import org.xwalk.core.XWalkSettings;
 import org.xwalk.core.XWalkUIClient;
@@ -120,7 +126,7 @@ public class PlayActivity extends BaseActivity {
         mController.setCanChangePosition(true);
         mController.setEnableInNormal(true);
         mController.setGestureEnabled(true);
-        mVideoView.setProgressManager(new ProgressManager() {
+        ProgressManager progressManager = new ProgressManager() {
             @Override
             public void saveProgress(String url, long progress) {
                 CacheManager.save(MD5.string2MD5(url), progress);
@@ -143,11 +149,15 @@ public class PlayActivity extends BaseActivity {
                     return skip;
                 return rec;
             }
-        });
+        };
+        mVideoView.setProgressManager(progressManager);
         mController.setListener(new VodController.VodControlListener() {
             @Override
-            public void playNext() {
+            public void playNext(boolean rmProgress) {
+                String preProgressKey = progressKey;
                 PlayActivity.this.playNext();
+                if (rmProgress && preProgressKey != null)
+                    CacheManager.delete(MD5.string2MD5(preProgressKey), 0);
             }
 
             @Override
@@ -218,6 +228,29 @@ public class PlayActivity extends BaseActivity {
                 if (mVideoView != null) {
                     mVideoView.release();
                     if (url != null) {
+                        try {
+                            int playerType = mVodPlayerCfg.getInt("pl");
+                            if (playerType >= 10) {
+                                VodInfo.VodSeries vs = mVodInfo.seriesMap.get(mVodInfo.playFlag).get(mVodInfo.playIndex);
+                                String playTitle = mVodInfo.name + " " + vs.name;
+                                setTip("调用外部播放器" + PlayerHelper.getPlayerName(playerType) + "进行播放", true, false);
+                                boolean callResult = false;
+                                switch (playerType) {
+                                    case 10: {
+                                        callResult = MXPlayer.run(PlayActivity.this, url, playTitle, playSubtitle, headers);
+                                        break;
+                                    }
+                                    case 11: {
+                                        callResult = ReexPlayer.run(PlayActivity.this, url, playTitle, playSubtitle, headers);
+                                        break;
+                                    }
+                                }
+                                setTip("调用外部播放器" + PlayerHelper.getPlayerName(playerType) + (callResult ? "成功" : "失败"), callResult, !callResult);
+                                return;
+                            }
+                        } catch (JSONException e) {
+                            e.printStackTrace();
+                        }
                         hideTip();
                         PlayerHelper.updateCfg(mVideoView, mVodPlayerCfg);
                         mVideoView.setProgressKey(progressKey);
@@ -244,6 +277,7 @@ public class PlayActivity extends BaseActivity {
                         progressKey = info.optString("proKey", null);
                         boolean parse = info.optString("parse", "1").equals("1");
                         boolean jx = info.optString("jx", "0").equals("1");
+                        playSubtitle = info.optString("subt", /*"https://dash.akamaized.net/akamai/test/caption_test/ElephantsDream/ElephantsDream_en.vtt"*/"");
                         String playUrl = info.optString("playUrl", "");
                         String flag = info.optString("flag");
                         String url = info.getString("url");
@@ -429,9 +463,32 @@ public class PlayActivity extends BaseActivity {
 
         playUrl(null, null);
         String progressKey = mVodInfo.sourceKey + mVodInfo.id + mVodInfo.playFlag + mVodInfo.playIndex;
+        if (Thunder.play(vs.url, new Thunder.ThunderCallback() {
+            @Override
+            public void status(int code, String info) {
+                if (code < 0) {
+                    setTip(info, false, true);
+                } else {
+                    setTip(info, true, false);
+                }
+            }
+
+            @Override
+            public void list(String playList) {
+            }
+
+            @Override
+            public void play(String url) {
+                playUrl(url, null);
+            }
+        })) {
+            mController.showParse(false);
+            return;
+        }
         sourceViewModel.getPlay(sourceKey, mVodInfo.playFlag, progressKey, vs.url);
     }
 
+    private String playSubtitle;
     private String progressKey;
     private String parseFlag;
     private String webUrl;
@@ -649,35 +706,49 @@ public class PlayActivity extends BaseActivity {
             parseThreadPool.execute(new Runnable() {
                 @Override
                 public void run() {
-                    JSONObject rs = ApiConfig.get().jsonExtMix(parseFlag, pb.getUrl(), finalExtendName, jxs, webUrl);
+                    JSONObject rs = ApiConfig.get().jsonExtMix(parseFlag + "111", pb.getUrl(), finalExtendName, jxs, webUrl);
                     if (rs == null || !rs.has("url")) {
                         errorWithRetry("解析错误", false);
                     } else {
-                        HashMap<String, String> headers = null;
-                        if (rs.has("header")) {
-                            try {
-                                JSONObject hds = rs.getJSONObject("header");
-                                Iterator<String> keys = hds.keys();
-                                while (keys.hasNext()) {
-                                    String key = keys.next();
-                                    if (headers == null) {
-                                        headers = new HashMap<>();
-                                    }
-                                    headers.put(key, hds.getString(key));
-                                }
-                            } catch (Throwable th) {
-
-                            }
-                        }
-                        if (rs.has("jxFrom")) {
+                        if (rs.has("parse") && rs.optInt("parse", 0) == 1) {
                             runOnUiThread(new Runnable() {
                                 @Override
                                 public void run() {
-                                    Toast.makeText(mContext, "解析来自:" + rs.optString("jxFrom"), Toast.LENGTH_SHORT).show();
+                                    String mixParseUrl = DefaultConfig.checkReplaceProxy(rs.optString("url", ""));
+                                    stopParse();
+                                    setTip("正在嗅探播放地址", true, false);
+                                    mHandler.removeMessages(100);
+                                    mHandler.sendEmptyMessageDelayed(100, 20 * 1000);
+                                    loadWebView(mixParseUrl);
                                 }
                             });
+                        } else {
+                            HashMap<String, String> headers = null;
+                            if (rs.has("header")) {
+                                try {
+                                    JSONObject hds = rs.getJSONObject("header");
+                                    Iterator<String> keys = hds.keys();
+                                    while (keys.hasNext()) {
+                                        String key = keys.next();
+                                        if (headers == null) {
+                                            headers = new HashMap<>();
+                                        }
+                                        headers.put(key, hds.getString(key));
+                                    }
+                                } catch (Throwable th) {
+
+                                }
+                            }
+                            if (rs.has("jxFrom")) {
+                                runOnUiThread(new Runnable() {
+                                    @Override
+                                    public void run() {
+                                        Toast.makeText(mContext, "解析来自:" + rs.optString("jxFrom"), Toast.LENGTH_SHORT).show();
+                                    }
+                                });
+                            }
+                            playUrl(rs.optString("url", ""), headers);
                         }
-                        playUrl(rs.optString("url", ""), headers);
                     }
                 }
             });
@@ -801,7 +872,7 @@ public class PlayActivity extends BaseActivity {
         public void setOverScrollMode(int mode) {
             super.setOverScrollMode(mode);
             if (mContext instanceof Activity)
-                AutoSize.autoConvertDensityOfGlobal((Activity) mContext);
+                AutoSize.autoConvertDensityOfCustomAdapt((Activity) mContext, PlayActivity.this);
         }
 
         @Override
@@ -819,7 +890,7 @@ public class PlayActivity extends BaseActivity {
         public void setOverScrollMode(int mode) {
             super.setOverScrollMode(mode);
             if (mContext instanceof Activity)
-                AutoSize.autoConvertDensityOfGlobal((Activity) mContext);
+                AutoSize.autoConvertDensityOfCustomAdapt((Activity) mContext, PlayActivity.this);
         }
 
         @Override
@@ -880,6 +951,21 @@ public class PlayActivity extends BaseActivity {
             @Override
             public boolean onConsoleMessage(ConsoleMessage consoleMessage) {
                 return false;
+            }
+
+            @Override
+            public boolean onJsAlert(WebView view, String url, String message, JsResult result) {
+                return true;
+            }
+
+            @Override
+            public boolean onJsConfirm(WebView view, String url, String message, JsResult result) {
+                return true;
+            }
+
+            @Override
+            public boolean onJsPrompt(WebView view, String url, String message, String defaultValue, JsPromptResult result) {
+                return true;
             }
         });
         mSysWebClient = new SysWebClient();
@@ -1022,6 +1108,21 @@ public class PlayActivity extends BaseActivity {
             @Override
             public boolean onConsoleMessage(XWalkView view, String message, int lineNumber, String sourceId, ConsoleMessageType messageType) {
                 return false;
+            }
+
+            @Override
+            public boolean onJsAlert(XWalkView view, String url, String message, XWalkJavascriptResult result) {
+                return true;
+            }
+
+            @Override
+            public boolean onJsConfirm(XWalkView view, String url, String message, XWalkJavascriptResult result) {
+                return true;
+            }
+
+            @Override
+            public boolean onJsPrompt(XWalkView view, String url, String message, String defaultValue, XWalkJavascriptResult result) {
+                return true;
             }
         });
         mX5WebClient = new XWalkWebClient(webView);
